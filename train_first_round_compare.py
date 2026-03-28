@@ -29,6 +29,12 @@ SHARED_GROUPWISE_VARIANTS = (
     "shared-groupwise-g8",
     "shared-elementwise",
 )
+RESIDUAL_G8_VARIANTS = (
+    "shared-groupwise-g8",
+    "shared-groupwise-g8-alpha0p02",
+    "shared-groupwise-g8-alpha0p05",
+    "shared-groupwise-g8-alpha0p08",
+)
 
 
 def parse_args():
@@ -69,7 +75,8 @@ def parse_args():
         help=(
             "Variant names to run. Supported values include baseline, shared-headwise, "
             f"shared-elementwise, a-headwise, and shared-groupwise-g<N>. "
-            f"Recommended shared-groupwise sweep: {', '.join(SHARED_GROUPWISE_VARIANTS)}."
+            f"Recommended shared-groupwise sweep: {', '.join(SHARED_GROUPWISE_VARIANTS)}. "
+            f"Recommended residual g8 sweep: {', '.join(RESIDUAL_G8_VARIANTS)}."
         ),
     )
     return parser.parse_args()
@@ -254,7 +261,7 @@ def resolve_variant_config(variant_name: str, head_dim: int):
             "independent_attn_output_gate": True,
         }
 
-    match = re.fullmatch(r"shared-groupwise-g(\d+)", variant_name)
+    match = re.fullmatch(r"shared-groupwise-g(\d+)(?:-alpha(\d+(?:p\d+)?))?", variant_name)
     if match:
         num_gate_groups = int(match.group(1))
         if head_dim % num_gate_groups != 0:
@@ -262,7 +269,14 @@ def resolve_variant_config(variant_name: str, head_dim: int):
                 f"Variant `{variant_name}` is invalid because head_dim ({head_dim}) "
                 f"is not divisible by num_gate_groups ({num_gate_groups})."
             )
-        return {"num_gate_groups": num_gate_groups}
+        config_kwargs = {"num_gate_groups": num_gate_groups}
+        alpha_token = match.group(2)
+        if alpha_token is not None:
+            alpha = float(alpha_token.replace("p", "."))
+            if not 0.0 <= alpha <= 1.0:
+                raise ValueError(f"Variant `{variant_name}` has invalid alpha {alpha}.")
+            config_kwargs["attn_output_gate_residual_alpha"] = alpha
+        return config_kwargs
 
     raise ValueError(f"Unsupported variant: {variant_name}")
 
@@ -291,6 +305,10 @@ def collect_gate_metrics(model):
     layer_means = []
     layer_s01 = []
     layer_s02 = []
+    layer_raw_means = []
+    layer_raw_s01 = []
+    layer_raw_s02 = []
+    residual_alphas = []
     for layer in model.model.layers:
         stats = getattr(layer.self_attn, "last_gate_stats", None)
         if not stats:
@@ -298,14 +316,25 @@ def collect_gate_metrics(model):
         layer_means.append(stats["mean"])
         layer_s01.append(stats["sparsity_01"])
         layer_s02.append(stats["sparsity_02"])
+        layer_raw_means.append(stats.get("raw_mean", stats["mean"]))
+        layer_raw_s01.append(stats.get("raw_sparsity_01", stats["sparsity_01"]))
+        layer_raw_s02.append(stats.get("raw_sparsity_02", stats["sparsity_02"]))
+        residual_alphas.append(stats.get("residual_alpha", 0.0))
 
     return {
+        "gate_residual_alpha": mean_or_none(residual_alphas),
         "gate_mean": mean_or_none(layer_means),
         "sparsity_01": mean_or_none(layer_s01),
         "sparsity_02": mean_or_none(layer_s02),
+        "raw_gate_mean": mean_or_none(layer_raw_means),
+        "raw_sparsity_01": mean_or_none(layer_raw_s01),
+        "raw_sparsity_02": mean_or_none(layer_raw_s02),
         "layer_gate_mean": layer_means,
         "layer_sparsity_01": layer_s01,
         "layer_sparsity_02": layer_s02,
+        "layer_raw_gate_mean": layer_raw_means,
+        "layer_raw_sparsity_01": layer_raw_s01,
+        "layer_raw_sparsity_02": layer_raw_s02,
     }
 
 
@@ -317,9 +346,16 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
     gate_means = []
     gate_s01 = []
     gate_s02 = []
+    raw_gate_means = []
+    raw_gate_s01 = []
+    raw_gate_s02 = []
+    gate_residual_alphas = []
     layer_gate_mean_batches = []
     layer_s01_batches = []
     layer_s02_batches = []
+    layer_raw_gate_mean_batches = []
+    layer_raw_s01_batches = []
+    layer_raw_s02_batches = []
 
     with torch.no_grad():
         for batch_index, batch in enumerate(valid_loader):
@@ -344,12 +380,19 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
 
             gate_metrics = collect_gate_metrics(model)
             if gate_metrics["gate_mean"] is not None:
+                gate_residual_alphas.append(gate_metrics["gate_residual_alpha"])
                 gate_means.append(gate_metrics["gate_mean"])
                 gate_s01.append(gate_metrics["sparsity_01"])
                 gate_s02.append(gate_metrics["sparsity_02"])
+                raw_gate_means.append(gate_metrics["raw_gate_mean"])
+                raw_gate_s01.append(gate_metrics["raw_sparsity_01"])
+                raw_gate_s02.append(gate_metrics["raw_sparsity_02"])
                 layer_gate_mean_batches.append(gate_metrics["layer_gate_mean"])
                 layer_s01_batches.append(gate_metrics["layer_sparsity_01"])
                 layer_s02_batches.append(gate_metrics["layer_sparsity_02"])
+                layer_raw_gate_mean_batches.append(gate_metrics["layer_raw_gate_mean"])
+                layer_raw_s01_batches.append(gate_metrics["layer_raw_sparsity_01"])
+                layer_raw_s02_batches.append(gate_metrics["layer_raw_sparsity_02"])
 
     val_loss = mean_or_none(losses)
     ppl = None if val_loss is None else math.exp(min(val_loss, 20.0))
@@ -358,12 +401,19 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
         "ppl": ppl,
         "sink_score_all": mean_or_none(sink_all_values),
         "sink_score_excl_self": mean_or_none(sink_excl_self_values),
+        "gate_residual_alpha": mean_or_none(gate_residual_alphas),
         "gate_mean": mean_or_none(gate_means),
         "sparsity_01": mean_or_none(gate_s01),
         "sparsity_02": mean_or_none(gate_s02),
+        "raw_gate_mean": mean_or_none(raw_gate_means),
+        "raw_sparsity_01": mean_or_none(raw_gate_s01),
+        "raw_sparsity_02": mean_or_none(raw_gate_s02),
         "layer_gate_mean": average_layer_metrics(layer_gate_mean_batches),
         "layer_sparsity_01": average_layer_metrics(layer_s01_batches),
         "layer_sparsity_02": average_layer_metrics(layer_s02_batches),
+        "layer_raw_gate_mean": average_layer_metrics(layer_raw_gate_mean_batches),
+        "layer_raw_sparsity_01": average_layer_metrics(layer_raw_s01_batches),
+        "layer_raw_sparsity_02": average_layer_metrics(layer_raw_s02_batches),
     }
     return metrics
 

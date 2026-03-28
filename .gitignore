@@ -5,3 +5,5 @@ __pycache__/
 first_round_assets/
 first_round_runs*/
 tmp_smoke/
+shared_groupwise_runs/
+residual_g8_alpha_runs/

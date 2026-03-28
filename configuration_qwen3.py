@@ -173,6 +173,7 @@ class Qwen3Config(PretrainedConfig):
         attention_dropout=0.0,
         use_qk_norm=True,
         num_gate_groups=None,
+        attn_output_gate_residual_alpha=0.0,
         independent_attn_output_gate=False,
         context_aware_attn_output_gate=False,
         elementwise_attn_output_gate=False,
@@ -206,10 +207,14 @@ class Qwen3Config(PretrainedConfig):
         self.use_qk_norm = use_qk_norm
 
         self.num_gate_groups = num_gate_groups
+        self.attn_output_gate_residual_alpha = attn_output_gate_residual_alpha
         self.independent_attn_output_gate = independent_attn_output_gate
         self.context_aware_attn_output_gate = context_aware_attn_output_gate
         self.headwise_attn_output_gate = headwise_attn_output_gate
         self.elementwise_attn_output_gate = elementwise_attn_output_gate
+
+        if not 0.0 <= self.attn_output_gate_residual_alpha <= 1.0:
+            raise ValueError("`attn_output_gate_residual_alpha` must be within [0, 1].")
 
         if self.context_aware_attn_output_gate and not self.independent_attn_output_gate:
             raise ValueError("`context_aware_attn_output_gate=True` requires `independent_attn_output_gate=True`.")
@@ -251,6 +256,11 @@ class Qwen3Config(PretrainedConfig):
             raise ValueError(
                 "Independent gate currently supports only legacy headwise/elementwise modes. "
                 "Set `num_gate_groups` via shared gating only."
+            )
+
+        if self.attn_output_gate_residual_alpha != 0.0 and self.num_gate_groups is None:
+            raise ValueError(
+                "`attn_output_gate_residual_alpha` requires attention output gating to be enabled."
             )
 
         # Validate the correctness of rotary position embeddings parameters

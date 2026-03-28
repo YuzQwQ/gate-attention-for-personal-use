@@ -261,6 +261,7 @@ class Qwen3Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.use_qk_norm = config.use_qk_norm
         self.num_gate_groups = config.num_gate_groups
+        self.attn_output_gate_residual_alpha = config.attn_output_gate_residual_alpha
         self.independent_attn_output_gate = config.independent_attn_output_gate
         self.context_aware_attn_output_gate = config.context_aware_attn_output_gate
         self.headwise_attn_output_gate = config.headwise_attn_output_gate
@@ -349,11 +350,19 @@ class Qwen3Attention(nn.Module):
             self.last_gate_stats = None
             return attn_output
 
-        gate = torch.sigmoid(gate_score)
+        raw_gate = torch.sigmoid(gate_score)
+        gate = raw_gate
+        if self.attn_output_gate_residual_alpha > 0.0:
+            gate = self.attn_output_gate_residual_alpha + (1.0 - self.attn_output_gate_residual_alpha) * gate
+
         self.last_gate_stats = {
+            "residual_alpha": self.attn_output_gate_residual_alpha,
             "mean": gate.mean().detach().item(),
             "sparsity_01": (gate < 0.1).float().mean().detach().item(),
             "sparsity_02": (gate < 0.2).float().mean().detach().item(),
+            "raw_mean": raw_gate.mean().detach().item(),
+            "raw_sparsity_01": (raw_gate < 0.1).float().mean().detach().item(),
+            "raw_sparsity_02": (raw_gate < 0.2).float().mean().detach().item(),
         }
 
         num_gate_groups = gate.shape[-1]

@@ -173,6 +173,8 @@ class Qwen3Config(PretrainedConfig):
         attention_dropout=0.0,
         use_qk_norm=True,
         num_gate_groups=None,
+        hybrid_attn_output_gate=False,
+        hybrid_gate_lambda=0.5,
         attn_output_gate_temperature=1.0,
         attn_output_gate_residual_alpha=0.0,
         independent_attn_output_gate=False,
@@ -208,6 +210,8 @@ class Qwen3Config(PretrainedConfig):
         self.use_qk_norm = use_qk_norm
 
         self.num_gate_groups = num_gate_groups
+        self.hybrid_attn_output_gate = hybrid_attn_output_gate
+        self.hybrid_gate_lambda = hybrid_gate_lambda
         self.attn_output_gate_temperature = attn_output_gate_temperature
         self.attn_output_gate_residual_alpha = attn_output_gate_residual_alpha
         self.independent_attn_output_gate = independent_attn_output_gate
@@ -215,6 +219,8 @@ class Qwen3Config(PretrainedConfig):
         self.headwise_attn_output_gate = headwise_attn_output_gate
         self.elementwise_attn_output_gate = elementwise_attn_output_gate
 
+        if not 0.0 <= self.hybrid_gate_lambda <= 1.0:
+            raise ValueError("`hybrid_gate_lambda` must be within [0, 1].")
         if self.attn_output_gate_temperature <= 0.0:
             raise ValueError("`attn_output_gate_temperature` must be > 0.")
         if not 0.0 <= self.attn_output_gate_residual_alpha <= 1.0:
@@ -271,6 +277,23 @@ class Qwen3Config(PretrainedConfig):
             raise ValueError(
                 "`attn_output_gate_temperature` requires attention output gating to be enabled."
             )
+
+        if self.hybrid_attn_output_gate:
+            if self.independent_attn_output_gate:
+                raise ValueError("`hybrid_attn_output_gate=True` is only supported for shared gating.")
+            if self.headwise_attn_output_gate or self.elementwise_attn_output_gate:
+                raise ValueError(
+                    "`hybrid_attn_output_gate=True` cannot be combined with legacy "
+                    "`headwise_attn_output_gate` / `elementwise_attn_output_gate` flags."
+                )
+            if self.num_gate_groups is None or self.num_gate_groups <= 1:
+                raise ValueError(
+                    "`hybrid_attn_output_gate=True` requires `num_gate_groups` to be set to an integer > 1."
+                )
+            if self.attn_output_gate_temperature != 1.0 or self.attn_output_gate_residual_alpha != 0.0:
+                raise ValueError(
+                    "`hybrid_attn_output_gate=True` cannot be combined with temperature or residual gate tweaks."
+                )
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.

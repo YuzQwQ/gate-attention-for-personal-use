@@ -40,6 +40,13 @@ TEMPERATURE_G8_VARIANTS = (
     "shared-groupwise-g8-tau1p0",
     "shared-groupwise-g8-tau1p3",
 )
+HYBRID_G8_VARIANTS = (
+    "shared-headwise",
+    "shared-groupwise-g8",
+    "shared-hybrid-g8-lambda0p25",
+    "shared-hybrid-g8-lambda0p5",
+    "shared-hybrid-g8-lambda0p75",
+)
 
 
 def parse_args():
@@ -82,7 +89,8 @@ def parse_args():
             f"shared-elementwise, a-headwise, and shared-groupwise-g<N>. "
             f"Recommended shared-groupwise sweep: {', '.join(SHARED_GROUPWISE_VARIANTS)}. "
             f"Recommended residual g8 sweep: {', '.join(RESIDUAL_G8_VARIANTS)}. "
-            f"Recommended temperature g8 sweep: {', '.join(TEMPERATURE_G8_VARIANTS)}."
+            f"Recommended temperature g8 sweep: {', '.join(TEMPERATURE_G8_VARIANTS)}. "
+            f"Recommended hybrid g8 sweep: {', '.join(HYBRID_G8_VARIANTS)}."
         ),
     )
     return parser.parse_args()
@@ -267,6 +275,23 @@ def resolve_variant_config(variant_name: str, head_dim: int):
             "independent_attn_output_gate": True,
         }
 
+    hybrid_match = re.fullmatch(r"shared-hybrid-g(\d+)-lambda(\d+(?:p\d+)?)", variant_name)
+    if hybrid_match:
+        num_gate_groups = int(hybrid_match.group(1))
+        if head_dim % num_gate_groups != 0:
+            raise ValueError(
+                f"Variant `{variant_name}` is invalid because head_dim ({head_dim}) "
+                f"is not divisible by num_gate_groups ({num_gate_groups})."
+            )
+        hybrid_gate_lambda = float(hybrid_match.group(2).replace("p", "."))
+        if not 0.0 <= hybrid_gate_lambda <= 1.0:
+            raise ValueError(f"Variant `{variant_name}` has invalid lambda {hybrid_gate_lambda}.")
+        return {
+            "num_gate_groups": num_gate_groups,
+            "hybrid_attn_output_gate": True,
+            "hybrid_gate_lambda": hybrid_gate_lambda,
+        }
+
     match = re.fullmatch(
         r"shared-groupwise-g(\d+)(?:-alpha(\d+(?:p\d+)?))?(?:-tau(\d+(?:p\d+)?))?",
         variant_name,
@@ -318,53 +343,113 @@ def average_layer_metrics(metric_batches):
 
 def collect_gate_metrics(model):
     layer_means = []
+    layer_stds = []
     layer_s01 = []
     layer_s02 = []
     layer_raw_means = []
+    layer_raw_stds = []
     layer_raw_s01 = []
     layer_raw_s02 = []
     layer_base_means = []
+    layer_base_stds = []
     layer_base_s01 = []
     layer_base_s02 = []
     gate_temperatures = []
     residual_alphas = []
+    hybrid_gate_lambdas = []
+    layer_head_gate_mean = []
+    layer_head_gate_std = []
+    layer_head_gate_sparsity_02 = []
+    layer_group_gate_mean = []
+    layer_group_gate_std = []
+    layer_group_gate_sparsity_02 = []
+    layer_hybrid_gate_mean = []
+    layer_hybrid_gate_std = []
+    layer_hybrid_gate_sparsity_02 = []
+    layer_head_group_pearson = []
+    layer_head_group_cosine = []
     for layer in model.model.layers:
         stats = getattr(layer.self_attn, "last_gate_stats", None)
         if not stats:
             continue
         layer_means.append(stats["mean"])
+        layer_stds.append(stats.get("std", 0.0))
         layer_s01.append(stats["sparsity_01"])
         layer_s02.append(stats["sparsity_02"])
         layer_raw_means.append(stats.get("raw_mean", stats["mean"]))
+        layer_raw_stds.append(stats.get("raw_std", stats.get("std", 0.0)))
         layer_raw_s01.append(stats.get("raw_sparsity_01", stats["sparsity_01"]))
         layer_raw_s02.append(stats.get("raw_sparsity_02", stats["sparsity_02"]))
         layer_base_means.append(stats.get("base_mean", stats.get("raw_mean", stats["mean"])))
+        layer_base_stds.append(stats.get("base_std", stats.get("raw_std", stats.get("std", 0.0))))
         layer_base_s01.append(stats.get("base_sparsity_01", stats.get("raw_sparsity_01", stats["sparsity_01"])))
         layer_base_s02.append(stats.get("base_sparsity_02", stats.get("raw_sparsity_02", stats["sparsity_02"])))
         gate_temperatures.append(stats.get("temperature", 1.0))
         residual_alphas.append(stats.get("residual_alpha", 0.0))
+        hybrid_gate_lambdas.append(stats.get("hybrid_gate_lambda"))
+        if stats.get("head_gate_mean") is not None:
+            layer_head_gate_mean.append(stats["head_gate_mean"])
+            layer_head_gate_std.append(stats["head_gate_std"])
+            layer_head_gate_sparsity_02.append(stats["head_gate_sparsity_02"])
+            layer_group_gate_mean.append(stats["group_gate_mean"])
+            layer_group_gate_std.append(stats["group_gate_std"])
+            layer_group_gate_sparsity_02.append(stats["group_gate_sparsity_02"])
+            layer_hybrid_gate_mean.append(stats["hybrid_gate_mean"])
+            layer_hybrid_gate_std.append(stats["hybrid_gate_std"])
+            layer_hybrid_gate_sparsity_02.append(stats["hybrid_gate_sparsity_02"])
+            layer_head_group_pearson.append(stats["head_group_pearson"])
+            layer_head_group_cosine.append(stats["head_group_cosine"])
 
     return {
         "gate_temperature": mean_or_none(gate_temperatures),
         "gate_residual_alpha": mean_or_none(residual_alphas),
+        "hybrid_gate_lambda": mean_or_none([value for value in hybrid_gate_lambdas if value is not None]),
         "gate_mean": mean_or_none(layer_means),
+        "gate_std": mean_or_none(layer_stds),
         "sparsity_01": mean_or_none(layer_s01),
         "sparsity_02": mean_or_none(layer_s02),
         "raw_gate_mean": mean_or_none(layer_raw_means),
+        "raw_gate_std": mean_or_none(layer_raw_stds),
         "raw_sparsity_01": mean_or_none(layer_raw_s01),
         "raw_sparsity_02": mean_or_none(layer_raw_s02),
         "base_gate_mean": mean_or_none(layer_base_means),
+        "base_gate_std": mean_or_none(layer_base_stds),
         "base_sparsity_01": mean_or_none(layer_base_s01),
         "base_sparsity_02": mean_or_none(layer_base_s02),
+        "head_gate_mean": mean_or_none(layer_head_gate_mean),
+        "head_gate_std": mean_or_none(layer_head_gate_std),
+        "head_gate_sparsity_02": mean_or_none(layer_head_gate_sparsity_02),
+        "group_gate_mean": mean_or_none(layer_group_gate_mean),
+        "group_gate_std": mean_or_none(layer_group_gate_std),
+        "group_gate_sparsity_02": mean_or_none(layer_group_gate_sparsity_02),
+        "hybrid_gate_mean": mean_or_none(layer_hybrid_gate_mean),
+        "hybrid_gate_std": mean_or_none(layer_hybrid_gate_std),
+        "hybrid_gate_sparsity_02": mean_or_none(layer_hybrid_gate_sparsity_02),
+        "head_group_pearson": mean_or_none(layer_head_group_pearson),
+        "head_group_cosine": mean_or_none(layer_head_group_cosine),
         "layer_gate_mean": layer_means,
+        "layer_gate_std": layer_stds,
         "layer_sparsity_01": layer_s01,
         "layer_sparsity_02": layer_s02,
         "layer_raw_gate_mean": layer_raw_means,
+        "layer_raw_gate_std": layer_raw_stds,
         "layer_raw_sparsity_01": layer_raw_s01,
         "layer_raw_sparsity_02": layer_raw_s02,
         "layer_base_gate_mean": layer_base_means,
+        "layer_base_gate_std": layer_base_stds,
         "layer_base_sparsity_01": layer_base_s01,
         "layer_base_sparsity_02": layer_base_s02,
+        "layer_head_gate_mean": layer_head_gate_mean,
+        "layer_head_gate_std": layer_head_gate_std,
+        "layer_head_gate_sparsity_02": layer_head_gate_sparsity_02,
+        "layer_group_gate_mean": layer_group_gate_mean,
+        "layer_group_gate_std": layer_group_gate_std,
+        "layer_group_gate_sparsity_02": layer_group_gate_sparsity_02,
+        "layer_hybrid_gate_mean": layer_hybrid_gate_mean,
+        "layer_hybrid_gate_std": layer_hybrid_gate_std,
+        "layer_hybrid_gate_sparsity_02": layer_hybrid_gate_sparsity_02,
+        "layer_head_group_pearson": layer_head_group_pearson,
+        "layer_head_group_cosine": layer_head_group_cosine,
     }
 
 
@@ -374,25 +459,54 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
     sink_all_values = []
     sink_excl_self_values = []
     gate_means = []
+    gate_stds = []
     gate_s01 = []
     gate_s02 = []
     raw_gate_means = []
+    raw_gate_stds = []
     raw_gate_s01 = []
     raw_gate_s02 = []
     base_gate_means = []
+    base_gate_stds = []
     base_gate_s01 = []
     base_gate_s02 = []
     gate_temperatures = []
     gate_residual_alphas = []
+    hybrid_gate_lambdas = []
+    head_gate_means = []
+    head_gate_stds = []
+    head_gate_s02 = []
+    group_gate_means = []
+    group_gate_stds = []
+    group_gate_s02 = []
+    hybrid_gate_means = []
+    hybrid_gate_stds = []
+    hybrid_gate_s02 = []
+    head_group_pearsons = []
+    head_group_cosines = []
     layer_gate_mean_batches = []
+    layer_gate_std_batches = []
     layer_s01_batches = []
     layer_s02_batches = []
     layer_raw_gate_mean_batches = []
+    layer_raw_gate_std_batches = []
     layer_raw_s01_batches = []
     layer_raw_s02_batches = []
     layer_base_gate_mean_batches = []
+    layer_base_gate_std_batches = []
     layer_base_s01_batches = []
     layer_base_s02_batches = []
+    layer_head_gate_mean_batches = []
+    layer_head_gate_std_batches = []
+    layer_head_gate_s02_batches = []
+    layer_group_gate_mean_batches = []
+    layer_group_gate_std_batches = []
+    layer_group_gate_s02_batches = []
+    layer_hybrid_gate_mean_batches = []
+    layer_hybrid_gate_std_batches = []
+    layer_hybrid_gate_s02_batches = []
+    layer_head_group_pearson_batches = []
+    layer_head_group_cosine_batches = []
 
     with torch.no_grad():
         for batch_index, batch in enumerate(valid_loader):
@@ -419,24 +533,56 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
             if gate_metrics["gate_mean"] is not None:
                 gate_temperatures.append(gate_metrics["gate_temperature"])
                 gate_residual_alphas.append(gate_metrics["gate_residual_alpha"])
+                if gate_metrics["hybrid_gate_lambda"] is not None:
+                    hybrid_gate_lambdas.append(gate_metrics["hybrid_gate_lambda"])
                 gate_means.append(gate_metrics["gate_mean"])
+                gate_stds.append(gate_metrics["gate_std"])
                 gate_s01.append(gate_metrics["sparsity_01"])
                 gate_s02.append(gate_metrics["sparsity_02"])
                 raw_gate_means.append(gate_metrics["raw_gate_mean"])
+                raw_gate_stds.append(gate_metrics["raw_gate_std"])
                 raw_gate_s01.append(gate_metrics["raw_sparsity_01"])
                 raw_gate_s02.append(gate_metrics["raw_sparsity_02"])
                 base_gate_means.append(gate_metrics["base_gate_mean"])
+                base_gate_stds.append(gate_metrics["base_gate_std"])
                 base_gate_s01.append(gate_metrics["base_sparsity_01"])
                 base_gate_s02.append(gate_metrics["base_sparsity_02"])
+                if gate_metrics["head_gate_mean"] is not None:
+                    head_gate_means.append(gate_metrics["head_gate_mean"])
+                    head_gate_stds.append(gate_metrics["head_gate_std"])
+                    head_gate_s02.append(gate_metrics["head_gate_sparsity_02"])
+                    group_gate_means.append(gate_metrics["group_gate_mean"])
+                    group_gate_stds.append(gate_metrics["group_gate_std"])
+                    group_gate_s02.append(gate_metrics["group_gate_sparsity_02"])
+                    hybrid_gate_means.append(gate_metrics["hybrid_gate_mean"])
+                    hybrid_gate_stds.append(gate_metrics["hybrid_gate_std"])
+                    hybrid_gate_s02.append(gate_metrics["hybrid_gate_sparsity_02"])
+                    head_group_pearsons.append(gate_metrics["head_group_pearson"])
+                    head_group_cosines.append(gate_metrics["head_group_cosine"])
                 layer_gate_mean_batches.append(gate_metrics["layer_gate_mean"])
+                layer_gate_std_batches.append(gate_metrics["layer_gate_std"])
                 layer_s01_batches.append(gate_metrics["layer_sparsity_01"])
                 layer_s02_batches.append(gate_metrics["layer_sparsity_02"])
                 layer_raw_gate_mean_batches.append(gate_metrics["layer_raw_gate_mean"])
+                layer_raw_gate_std_batches.append(gate_metrics["layer_raw_gate_std"])
                 layer_raw_s01_batches.append(gate_metrics["layer_raw_sparsity_01"])
                 layer_raw_s02_batches.append(gate_metrics["layer_raw_sparsity_02"])
                 layer_base_gate_mean_batches.append(gate_metrics["layer_base_gate_mean"])
+                layer_base_gate_std_batches.append(gate_metrics["layer_base_gate_std"])
                 layer_base_s01_batches.append(gate_metrics["layer_base_sparsity_01"])
                 layer_base_s02_batches.append(gate_metrics["layer_base_sparsity_02"])
+                if gate_metrics["layer_head_gate_mean"]:
+                    layer_head_gate_mean_batches.append(gate_metrics["layer_head_gate_mean"])
+                    layer_head_gate_std_batches.append(gate_metrics["layer_head_gate_std"])
+                    layer_head_gate_s02_batches.append(gate_metrics["layer_head_gate_sparsity_02"])
+                    layer_group_gate_mean_batches.append(gate_metrics["layer_group_gate_mean"])
+                    layer_group_gate_std_batches.append(gate_metrics["layer_group_gate_std"])
+                    layer_group_gate_s02_batches.append(gate_metrics["layer_group_gate_sparsity_02"])
+                    layer_hybrid_gate_mean_batches.append(gate_metrics["layer_hybrid_gate_mean"])
+                    layer_hybrid_gate_std_batches.append(gate_metrics["layer_hybrid_gate_std"])
+                    layer_hybrid_gate_s02_batches.append(gate_metrics["layer_hybrid_gate_sparsity_02"])
+                    layer_head_group_pearson_batches.append(gate_metrics["layer_head_group_pearson"])
+                    layer_head_group_cosine_batches.append(gate_metrics["layer_head_group_cosine"])
 
     val_loss = mean_or_none(losses)
     ppl = None if val_loss is None else math.exp(min(val_loss, 20.0))
@@ -447,24 +593,53 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
         "sink_score_excl_self": mean_or_none(sink_excl_self_values),
         "gate_temperature": mean_or_none(gate_temperatures),
         "gate_residual_alpha": mean_or_none(gate_residual_alphas),
+        "hybrid_gate_lambda": mean_or_none(hybrid_gate_lambdas),
         "gate_mean": mean_or_none(gate_means),
+        "gate_std": mean_or_none(gate_stds),
         "sparsity_01": mean_or_none(gate_s01),
         "sparsity_02": mean_or_none(gate_s02),
         "raw_gate_mean": mean_or_none(raw_gate_means),
+        "raw_gate_std": mean_or_none(raw_gate_stds),
         "raw_sparsity_01": mean_or_none(raw_gate_s01),
         "raw_sparsity_02": mean_or_none(raw_gate_s02),
         "base_gate_mean": mean_or_none(base_gate_means),
+        "base_gate_std": mean_or_none(base_gate_stds),
         "base_sparsity_01": mean_or_none(base_gate_s01),
         "base_sparsity_02": mean_or_none(base_gate_s02),
+        "head_gate_mean": mean_or_none(head_gate_means),
+        "head_gate_std": mean_or_none(head_gate_stds),
+        "head_gate_sparsity_02": mean_or_none(head_gate_s02),
+        "group_gate_mean": mean_or_none(group_gate_means),
+        "group_gate_std": mean_or_none(group_gate_stds),
+        "group_gate_sparsity_02": mean_or_none(group_gate_s02),
+        "hybrid_gate_mean": mean_or_none(hybrid_gate_means),
+        "hybrid_gate_std": mean_or_none(hybrid_gate_stds),
+        "hybrid_gate_sparsity_02": mean_or_none(hybrid_gate_s02),
+        "head_group_pearson": mean_or_none(head_group_pearsons),
+        "head_group_cosine": mean_or_none(head_group_cosines),
         "layer_gate_mean": average_layer_metrics(layer_gate_mean_batches),
+        "layer_gate_std": average_layer_metrics(layer_gate_std_batches),
         "layer_sparsity_01": average_layer_metrics(layer_s01_batches),
         "layer_sparsity_02": average_layer_metrics(layer_s02_batches),
         "layer_raw_gate_mean": average_layer_metrics(layer_raw_gate_mean_batches),
+        "layer_raw_gate_std": average_layer_metrics(layer_raw_gate_std_batches),
         "layer_raw_sparsity_01": average_layer_metrics(layer_raw_s01_batches),
         "layer_raw_sparsity_02": average_layer_metrics(layer_raw_s02_batches),
         "layer_base_gate_mean": average_layer_metrics(layer_base_gate_mean_batches),
+        "layer_base_gate_std": average_layer_metrics(layer_base_gate_std_batches),
         "layer_base_sparsity_01": average_layer_metrics(layer_base_s01_batches),
         "layer_base_sparsity_02": average_layer_metrics(layer_base_s02_batches),
+        "layer_head_gate_mean": average_layer_metrics(layer_head_gate_mean_batches),
+        "layer_head_gate_std": average_layer_metrics(layer_head_gate_std_batches),
+        "layer_head_gate_sparsity_02": average_layer_metrics(layer_head_gate_s02_batches),
+        "layer_group_gate_mean": average_layer_metrics(layer_group_gate_mean_batches),
+        "layer_group_gate_std": average_layer_metrics(layer_group_gate_std_batches),
+        "layer_group_gate_sparsity_02": average_layer_metrics(layer_group_gate_s02_batches),
+        "layer_hybrid_gate_mean": average_layer_metrics(layer_hybrid_gate_mean_batches),
+        "layer_hybrid_gate_std": average_layer_metrics(layer_hybrid_gate_std_batches),
+        "layer_hybrid_gate_sparsity_02": average_layer_metrics(layer_hybrid_gate_s02_batches),
+        "layer_head_group_pearson": average_layer_metrics(layer_head_group_pearson_batches),
+        "layer_head_group_cosine": average_layer_metrics(layer_head_group_cosine_batches),
     }
     return metrics
 

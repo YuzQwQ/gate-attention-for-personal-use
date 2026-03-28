@@ -261,6 +261,8 @@ class Qwen3Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.use_qk_norm = config.use_qk_norm
         self.num_gate_groups = config.num_gate_groups
+        self.hybrid_attn_output_gate = config.hybrid_attn_output_gate
+        self.hybrid_gate_lambda = config.hybrid_gate_lambda
         self.attn_output_gate_temperature = config.attn_output_gate_temperature
         self.attn_output_gate_residual_alpha = config.attn_output_gate_residual_alpha
         self.independent_attn_output_gate = config.independent_attn_output_gate
@@ -268,8 +270,13 @@ class Qwen3Attention(nn.Module):
         self.headwise_attn_output_gate = config.headwise_attn_output_gate
         self.elementwise_attn_output_gate = config.elementwise_attn_output_gate
         self.attn_implementation = getattr(config, "_attn_implementation", "eager")
+        self.use_shared_hybrid_attn_output_gate = (
+            self.hybrid_attn_output_gate and not self.independent_attn_output_gate
+        )
         self.use_shared_groupwise_attn_output_gate = (
-            self.num_gate_groups is not None and not self.independent_attn_output_gate
+            self.num_gate_groups is not None
+            and not self.independent_attn_output_gate
+            and not self.hybrid_attn_output_gate
         )
 
         if self.context_aware_attn_output_gate:
@@ -297,6 +304,12 @@ class Qwen3Attention(nn.Module):
                 self.gate_proj = nn.Linear(
                     self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias
                 )
+        elif self.use_shared_hybrid_attn_output_gate:
+            self.q_proj = nn.Linear(
+                self.hidden_size,
+                self.num_heads * self.head_dim + self.num_heads + self.num_heads * self.num_gate_groups,
+                bias=config.qkv_bias,
+            )
         elif self.use_shared_groupwise_attn_output_gate:
             self.q_proj = nn.Linear(
                 self.hidden_size,
@@ -317,7 +330,7 @@ class Qwen3Attention(nn.Module):
 
     def _project_query_states_and_gate(
             self, hidden_states: torch.Tensor, bsz: int, q_len: int
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[Union[torch.Tensor, dict]]]:
         query_states = self.q_proj(hidden_states)
         gate_score = None
 
@@ -327,6 +340,22 @@ class Qwen3Attention(nn.Module):
             elif self.elementwise_attn_output_gate:
                 gate_score = self.gate_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
             query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        elif self.use_shared_hybrid_attn_output_gate:
+            query_states = query_states.view(bsz, q_len, self.num_key_value_heads, -1)
+            query_states, headwise_gate_score, groupwise_gate_score = torch.split(
+                query_states,
+                [
+                    self.head_dim * self.num_key_value_groups,
+                    self.num_key_value_groups,
+                    self.num_gate_groups * self.num_key_value_groups,
+                ],
+                dim=-1,
+            )
+            gate_score = {
+                "headwise": headwise_gate_score.reshape(bsz, q_len, -1, 1),
+                "groupwise": groupwise_gate_score.reshape(bsz, q_len, -1, self.num_gate_groups),
+            }
+            query_states = query_states.reshape(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         elif self.use_shared_groupwise_attn_output_gate:
             query_states = query_states.view(bsz, q_len, self.num_key_value_heads, -1)
             query_states, gate_score = torch.split(
@@ -345,31 +374,79 @@ class Qwen3Attention(nn.Module):
         return query_states, gate_score
 
     def _apply_attn_output_gate(
-            self, attn_output: torch.Tensor, gate_score: Optional[torch.Tensor]
+            self, attn_output: torch.Tensor, gate_score: Optional[Union[torch.Tensor, dict]]
     ) -> torch.Tensor:
         if gate_score is None:
             self.last_gate_stats = None
             return attn_output
 
-        base_gate = torch.sigmoid(gate_score)
-        tempered_gate = torch.sigmoid(gate_score / self.attn_output_gate_temperature)
-        gate = tempered_gate
-        if self.attn_output_gate_residual_alpha > 0.0:
-            gate = self.attn_output_gate_residual_alpha + (1.0 - self.attn_output_gate_residual_alpha) * gate
+        if isinstance(gate_score, dict):
+            head_gate = torch.sigmoid(gate_score["headwise"])
+            group_gate = torch.sigmoid(gate_score["groupwise"])
+            expanded_head_gate = head_gate.expand(-1, -1, -1, group_gate.shape[-1])
+            hybrid_gate = self.hybrid_gate_lambda * expanded_head_gate + (1.0 - self.hybrid_gate_lambda) * group_gate
 
-        self.last_gate_stats = {
-            "temperature": self.attn_output_gate_temperature,
-            "residual_alpha": self.attn_output_gate_residual_alpha,
-            "mean": gate.mean().detach().item(),
-            "sparsity_01": (gate < 0.1).float().mean().detach().item(),
-            "sparsity_02": (gate < 0.2).float().mean().detach().item(),
-            "raw_mean": tempered_gate.mean().detach().item(),
-            "raw_sparsity_01": (tempered_gate < 0.1).float().mean().detach().item(),
-            "raw_sparsity_02": (tempered_gate < 0.2).float().mean().detach().item(),
-            "base_mean": base_gate.mean().detach().item(),
-            "base_sparsity_01": (base_gate < 0.1).float().mean().detach().item(),
-            "base_sparsity_02": (base_gate < 0.2).float().mean().detach().item(),
-        }
+            head_stats = self._summarize_gate(expanded_head_gate)
+            group_stats = self._summarize_gate(group_gate)
+            hybrid_stats = self._summarize_gate(hybrid_gate)
+            pearson_corr, cosine_similarity = self._pair_similarity(expanded_head_gate, group_gate)
+
+            self.last_gate_stats = {
+                "hybrid_gate_lambda": self.hybrid_gate_lambda,
+                "head_gate_mean": head_stats["mean"],
+                "head_gate_std": head_stats["std"],
+                "head_gate_sparsity_02": head_stats["sparsity_02"],
+                "group_gate_mean": group_stats["mean"],
+                "group_gate_std": group_stats["std"],
+                "group_gate_sparsity_02": group_stats["sparsity_02"],
+                "hybrid_gate_mean": hybrid_stats["mean"],
+                "hybrid_gate_std": hybrid_stats["std"],
+                "hybrid_gate_sparsity_02": hybrid_stats["sparsity_02"],
+                "head_group_pearson": pearson_corr,
+                "head_group_cosine": cosine_similarity,
+                "temperature": self.attn_output_gate_temperature,
+                "residual_alpha": self.attn_output_gate_residual_alpha,
+                "mean": hybrid_stats["mean"],
+                "std": hybrid_stats["std"],
+                "sparsity_01": hybrid_stats["sparsity_01"],
+                "sparsity_02": hybrid_stats["sparsity_02"],
+                "raw_mean": hybrid_stats["mean"],
+                "raw_std": hybrid_stats["std"],
+                "raw_sparsity_01": hybrid_stats["sparsity_01"],
+                "raw_sparsity_02": hybrid_stats["sparsity_02"],
+                "base_mean": hybrid_stats["mean"],
+                "base_std": hybrid_stats["std"],
+                "base_sparsity_01": hybrid_stats["sparsity_01"],
+                "base_sparsity_02": hybrid_stats["sparsity_02"],
+            }
+            gate = hybrid_gate
+        else:
+            base_gate = torch.sigmoid(gate_score)
+            tempered_gate = torch.sigmoid(gate_score / self.attn_output_gate_temperature)
+            gate = tempered_gate
+            if self.attn_output_gate_residual_alpha > 0.0:
+                gate = self.attn_output_gate_residual_alpha + (1.0 - self.attn_output_gate_residual_alpha) * gate
+
+            gate_stats = self._summarize_gate(gate)
+            raw_stats = self._summarize_gate(tempered_gate)
+            base_stats = self._summarize_gate(base_gate)
+
+            self.last_gate_stats = {
+                "temperature": self.attn_output_gate_temperature,
+                "residual_alpha": self.attn_output_gate_residual_alpha,
+                "mean": gate_stats["mean"],
+                "std": gate_stats["std"],
+                "sparsity_01": gate_stats["sparsity_01"],
+                "sparsity_02": gate_stats["sparsity_02"],
+                "raw_mean": raw_stats["mean"],
+                "raw_std": raw_stats["std"],
+                "raw_sparsity_01": raw_stats["sparsity_01"],
+                "raw_sparsity_02": raw_stats["sparsity_02"],
+                "base_mean": base_stats["mean"],
+                "base_std": base_stats["std"],
+                "base_sparsity_01": base_stats["sparsity_01"],
+                "base_sparsity_02": base_stats["sparsity_02"],
+            }
 
         num_gate_groups = gate.shape[-1]
         if self.head_dim % num_gate_groups != 0:
@@ -382,6 +459,33 @@ class Qwen3Attention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, num_heads, num_gate_groups, group_dim)
         attn_output = attn_output * gate.unsqueeze(-1)
         return attn_output.reshape(bsz, q_len, num_heads, head_dim)
+
+    @staticmethod
+    def _summarize_gate(gate: torch.Tensor) -> dict:
+        return {
+            "mean": gate.mean().detach().item(),
+            "std": gate.std(unbiased=False).detach().item(),
+            "sparsity_01": (gate < 0.1).float().mean().detach().item(),
+            "sparsity_02": (gate < 0.2).float().mean().detach().item(),
+        }
+
+    @staticmethod
+    def _pair_similarity(a: torch.Tensor, b: torch.Tensor) -> Tuple[float, float]:
+        a_flat = a.float().reshape(-1)
+        b_flat = b.float().reshape(-1)
+        cosine_similarity = nn.functional.cosine_similarity(
+            a_flat.unsqueeze(0), b_flat.unsqueeze(0), dim=-1
+        ).detach().item()
+
+        a_centered = a_flat - a_flat.mean()
+        b_centered = b_flat - b_flat.mean()
+        denom = a_centered.norm() * b_centered.norm()
+        if denom.detach().item() == 0.0:
+            pearson_corr = 0.0
+        else:
+            pearson_corr = (a_centered * b_centered).sum().div(denom).detach().item()
+
+        return pearson_corr, cosine_similarity
 
     def forward(
             self,

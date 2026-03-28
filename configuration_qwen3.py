@@ -172,6 +172,9 @@ class Qwen3Config(PretrainedConfig):
         attention_bias=False,
         attention_dropout=0.0,
         use_qk_norm=True,
+        num_gate_groups=None,
+        independent_attn_output_gate=False,
+        context_aware_attn_output_gate=False,
         elementwise_attn_output_gate=False,
         headwise_attn_output_gate=False,
         **kwargs,
@@ -202,8 +205,53 @@ class Qwen3Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.use_qk_norm = use_qk_norm
 
+        self.num_gate_groups = num_gate_groups
+        self.independent_attn_output_gate = independent_attn_output_gate
+        self.context_aware_attn_output_gate = context_aware_attn_output_gate
         self.headwise_attn_output_gate = headwise_attn_output_gate
         self.elementwise_attn_output_gate = elementwise_attn_output_gate
+
+        if self.context_aware_attn_output_gate and not self.independent_attn_output_gate:
+            raise ValueError("`context_aware_attn_output_gate=True` requires `independent_attn_output_gate=True`.")
+
+        if self.headwise_attn_output_gate and self.elementwise_attn_output_gate:
+            raise ValueError("`headwise_attn_output_gate` and `elementwise_attn_output_gate` cannot both be True.")
+
+        legacy_num_gate_groups = None
+        if self.headwise_attn_output_gate:
+            legacy_num_gate_groups = 1
+        elif self.elementwise_attn_output_gate:
+            legacy_num_gate_groups = self.head_dim
+
+        if self.num_gate_groups is not None:
+            if self.num_gate_groups < 1:
+                raise ValueError("`num_gate_groups` must be a positive integer.")
+            if legacy_num_gate_groups is not None and self.num_gate_groups != legacy_num_gate_groups:
+                raise ValueError(
+                    "`num_gate_groups` cannot conflict with legacy gate flags "
+                    "`headwise_attn_output_gate` / `elementwise_attn_output_gate`."
+                )
+        else:
+            self.num_gate_groups = legacy_num_gate_groups
+
+        if self.num_gate_groups is not None and self.head_dim % self.num_gate_groups != 0:
+            raise ValueError(
+                f"`head_dim` ({self.head_dim}) must be divisible by `num_gate_groups` ({self.num_gate_groups})."
+            )
+
+        if self.independent_attn_output_gate and not (
+            self.headwise_attn_output_gate or self.elementwise_attn_output_gate
+        ):
+            raise ValueError(
+                "`independent_attn_output_gate=True` requires either `headwise_attn_output_gate=True` "
+                "or `elementwise_attn_output_gate=True`."
+            )
+
+        if self.independent_attn_output_gate and self.num_gate_groups not in (None, 1, self.head_dim):
+            raise ValueError(
+                "Independent gate currently supports only legacy headwise/elementwise modes. "
+                "Set `num_gate_groups` via shared gating only."
+            )
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.

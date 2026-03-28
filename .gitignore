@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+first_round_assets/
+first_round_runs*/
+tmp_smoke/

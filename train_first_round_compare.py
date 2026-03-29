@@ -47,6 +47,11 @@ HYBRID_G8_VARIANTS = (
     "shared-hybrid-g8-lambda0p5",
     "shared-hybrid-g8-lambda0p75",
 )
+IRG_G8_VARIANTS = (
+    "shared-groupwise-g8",
+    "shared-irg-g8-r16",
+    "shared-irg-g8-r32",
+)
 
 
 def parse_args():
@@ -90,7 +95,8 @@ def parse_args():
             f"Recommended shared-groupwise sweep: {', '.join(SHARED_GROUPWISE_VARIANTS)}. "
             f"Recommended residual g8 sweep: {', '.join(RESIDUAL_G8_VARIANTS)}. "
             f"Recommended temperature g8 sweep: {', '.join(TEMPERATURE_G8_VARIANTS)}. "
-            f"Recommended hybrid g8 sweep: {', '.join(HYBRID_G8_VARIANTS)}."
+            f"Recommended hybrid g8 sweep: {', '.join(HYBRID_G8_VARIANTS)}. "
+            f"Recommended IRG g8 sweep: {', '.join(IRG_G8_VARIANTS)}."
         ),
     )
     return parser.parse_args()
@@ -275,6 +281,23 @@ def resolve_variant_config(variant_name: str, head_dim: int):
             "independent_attn_output_gate": True,
         }
 
+    irg_match = re.fullmatch(r"shared-irg-g(\d+)(?:-r(\d+))?", variant_name)
+    if irg_match:
+        num_gate_groups = int(irg_match.group(1))
+        if head_dim % num_gate_groups != 0:
+            raise ValueError(
+                f"Variant `{variant_name}` is invalid because head_dim ({head_dim}) "
+                f"is not divisible by num_gate_groups ({num_gate_groups})."
+            )
+        routing_hidden_size = irg_match.group(2)
+        config_kwargs = {
+            "num_gate_groups": num_gate_groups,
+            "irg_attn_output_gate": True,
+        }
+        if routing_hidden_size is not None:
+            config_kwargs["irg_routing_hidden_size"] = int(routing_hidden_size)
+        return config_kwargs
+
     hybrid_match = re.fullmatch(r"shared-hybrid-g(\d+)-lambda(\d+(?:p\d+)?)", variant_name)
     if hybrid_match:
         num_gate_groups = int(hybrid_match.group(1))
@@ -354,6 +377,13 @@ def collect_gate_metrics(model):
     layer_base_stds = []
     layer_base_s01 = []
     layer_base_s02 = []
+    routing_hidden_sizes = []
+    routing_entropies = []
+    routing_max_probs = []
+    routing_token_consistencies = []
+    layer_irg_group_gate_mean = []
+    layer_irg_group_gate_std = []
+    layer_irg_group_gate_sparsity_02 = []
     gate_temperatures = []
     residual_alphas = []
     hybrid_gate_lambdas = []
@@ -384,6 +414,18 @@ def collect_gate_metrics(model):
         layer_base_stds.append(stats.get("base_std", stats.get("raw_std", stats.get("std", 0.0))))
         layer_base_s01.append(stats.get("base_sparsity_01", stats.get("raw_sparsity_01", stats["sparsity_01"])))
         layer_base_s02.append(stats.get("base_sparsity_02", stats.get("raw_sparsity_02", stats["sparsity_02"])))
+        if stats.get("routing_hidden_size") is not None:
+            routing_hidden_sizes.append(stats["routing_hidden_size"])
+        if stats.get("routing_entropy") is not None:
+            routing_entropies.append(stats["routing_entropy"])
+        if stats.get("routing_max_prob") is not None:
+            routing_max_probs.append(stats["routing_max_prob"])
+        if stats.get("routing_token_consistency") is not None:
+            routing_token_consistencies.append(stats["routing_token_consistency"])
+        if stats.get("irg_group_gate_mean") is not None:
+            layer_irg_group_gate_mean.append(stats["irg_group_gate_mean"])
+            layer_irg_group_gate_std.append(stats["irg_group_gate_std"])
+            layer_irg_group_gate_sparsity_02.append(stats["irg_group_gate_sparsity_02"])
         gate_temperatures.append(stats.get("temperature", 1.0))
         residual_alphas.append(stats.get("residual_alpha", 0.0))
         hybrid_gate_lambdas.append(stats.get("hybrid_gate_lambda"))
@@ -401,6 +443,10 @@ def collect_gate_metrics(model):
             layer_head_group_cosine.append(stats["head_group_cosine"])
 
     return {
+        "routing_hidden_size": mean_or_none(routing_hidden_sizes),
+        "routing_entropy": mean_or_none(routing_entropies),
+        "routing_max_prob": mean_or_none(routing_max_probs),
+        "routing_token_consistency": mean_or_none(routing_token_consistencies),
         "gate_temperature": mean_or_none(gate_temperatures),
         "gate_residual_alpha": mean_or_none(residual_alphas),
         "hybrid_gate_lambda": mean_or_none([value for value in hybrid_gate_lambdas if value is not None]),
@@ -416,6 +462,9 @@ def collect_gate_metrics(model):
         "base_gate_std": mean_or_none(layer_base_stds),
         "base_sparsity_01": mean_or_none(layer_base_s01),
         "base_sparsity_02": mean_or_none(layer_base_s02),
+        "irg_group_gate_mean": mean_or_none(layer_irg_group_gate_mean),
+        "irg_group_gate_std": mean_or_none(layer_irg_group_gate_std),
+        "irg_group_gate_sparsity_02": mean_or_none(layer_irg_group_gate_sparsity_02),
         "head_gate_mean": mean_or_none(layer_head_gate_mean),
         "head_gate_std": mean_or_none(layer_head_gate_std),
         "head_gate_sparsity_02": mean_or_none(layer_head_gate_sparsity_02),
@@ -439,6 +488,9 @@ def collect_gate_metrics(model):
         "layer_base_gate_std": layer_base_stds,
         "layer_base_sparsity_01": layer_base_s01,
         "layer_base_sparsity_02": layer_base_s02,
+        "layer_irg_group_gate_mean": layer_irg_group_gate_mean,
+        "layer_irg_group_gate_std": layer_irg_group_gate_std,
+        "layer_irg_group_gate_sparsity_02": layer_irg_group_gate_sparsity_02,
         "layer_head_gate_mean": layer_head_gate_mean,
         "layer_head_gate_std": layer_head_gate_std,
         "layer_head_gate_sparsity_02": layer_head_gate_sparsity_02,
@@ -470,6 +522,13 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
     base_gate_stds = []
     base_gate_s01 = []
     base_gate_s02 = []
+    routing_hidden_sizes = []
+    routing_entropies = []
+    routing_max_probs = []
+    routing_token_consistencies = []
+    irg_group_gate_means = []
+    irg_group_gate_stds = []
+    irg_group_gate_s02 = []
     gate_temperatures = []
     gate_residual_alphas = []
     hybrid_gate_lambdas = []
@@ -496,6 +555,9 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
     layer_base_gate_std_batches = []
     layer_base_s01_batches = []
     layer_base_s02_batches = []
+    layer_irg_group_gate_mean_batches = []
+    layer_irg_group_gate_std_batches = []
+    layer_irg_group_gate_s02_batches = []
     layer_head_gate_mean_batches = []
     layer_head_gate_std_batches = []
     layer_head_gate_s02_batches = []
@@ -531,6 +593,14 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
 
             gate_metrics = collect_gate_metrics(model)
             if gate_metrics["gate_mean"] is not None:
+                if gate_metrics["routing_hidden_size"] is not None:
+                    routing_hidden_sizes.append(gate_metrics["routing_hidden_size"])
+                if gate_metrics["routing_entropy"] is not None:
+                    routing_entropies.append(gate_metrics["routing_entropy"])
+                if gate_metrics["routing_max_prob"] is not None:
+                    routing_max_probs.append(gate_metrics["routing_max_prob"])
+                if gate_metrics["routing_token_consistency"] is not None:
+                    routing_token_consistencies.append(gate_metrics["routing_token_consistency"])
                 gate_temperatures.append(gate_metrics["gate_temperature"])
                 gate_residual_alphas.append(gate_metrics["gate_residual_alpha"])
                 if gate_metrics["hybrid_gate_lambda"] is not None:
@@ -547,6 +617,10 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
                 base_gate_stds.append(gate_metrics["base_gate_std"])
                 base_gate_s01.append(gate_metrics["base_sparsity_01"])
                 base_gate_s02.append(gate_metrics["base_sparsity_02"])
+                if gate_metrics["irg_group_gate_mean"] is not None:
+                    irg_group_gate_means.append(gate_metrics["irg_group_gate_mean"])
+                    irg_group_gate_stds.append(gate_metrics["irg_group_gate_std"])
+                    irg_group_gate_s02.append(gate_metrics["irg_group_gate_sparsity_02"])
                 if gate_metrics["head_gate_mean"] is not None:
                     head_gate_means.append(gate_metrics["head_gate_mean"])
                     head_gate_stds.append(gate_metrics["head_gate_std"])
@@ -571,6 +645,10 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
                 layer_base_gate_std_batches.append(gate_metrics["layer_base_gate_std"])
                 layer_base_s01_batches.append(gate_metrics["layer_base_sparsity_01"])
                 layer_base_s02_batches.append(gate_metrics["layer_base_sparsity_02"])
+                if gate_metrics["layer_irg_group_gate_mean"]:
+                    layer_irg_group_gate_mean_batches.append(gate_metrics["layer_irg_group_gate_mean"])
+                    layer_irg_group_gate_std_batches.append(gate_metrics["layer_irg_group_gate_std"])
+                    layer_irg_group_gate_s02_batches.append(gate_metrics["layer_irg_group_gate_sparsity_02"])
                 if gate_metrics["layer_head_gate_mean"]:
                     layer_head_gate_mean_batches.append(gate_metrics["layer_head_gate_mean"])
                     layer_head_gate_std_batches.append(gate_metrics["layer_head_gate_std"])
@@ -587,6 +665,10 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
     val_loss = mean_or_none(losses)
     ppl = None if val_loss is None else math.exp(min(val_loss, 20.0))
     metrics = {
+        "routing_hidden_size": mean_or_none(routing_hidden_sizes),
+        "routing_entropy": mean_or_none(routing_entropies),
+        "routing_max_prob": mean_or_none(routing_max_probs),
+        "routing_token_consistency": mean_or_none(routing_token_consistencies),
         "val_loss": val_loss,
         "ppl": ppl,
         "sink_score_all": mean_or_none(sink_all_values),
@@ -606,6 +688,9 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
         "base_gate_std": mean_or_none(base_gate_stds),
         "base_sparsity_01": mean_or_none(base_gate_s01),
         "base_sparsity_02": mean_or_none(base_gate_s02),
+        "irg_group_gate_mean": mean_or_none(irg_group_gate_means),
+        "irg_group_gate_std": mean_or_none(irg_group_gate_stds),
+        "irg_group_gate_sparsity_02": mean_or_none(irg_group_gate_s02),
         "head_gate_mean": mean_or_none(head_gate_means),
         "head_gate_std": mean_or_none(head_gate_stds),
         "head_gate_sparsity_02": mean_or_none(head_gate_s02),
@@ -629,6 +714,9 @@ def evaluate(model, valid_loader, device: str, max_eval_batches: int):
         "layer_base_gate_std": average_layer_metrics(layer_base_gate_std_batches),
         "layer_base_sparsity_01": average_layer_metrics(layer_base_s01_batches),
         "layer_base_sparsity_02": average_layer_metrics(layer_base_s02_batches),
+        "layer_irg_group_gate_mean": average_layer_metrics(layer_irg_group_gate_mean_batches),
+        "layer_irg_group_gate_std": average_layer_metrics(layer_irg_group_gate_std_batches),
+        "layer_irg_group_gate_sparsity_02": average_layer_metrics(layer_irg_group_gate_s02_batches),
         "layer_head_gate_mean": average_layer_metrics(layer_head_gate_mean_batches),
         "layer_head_gate_std": average_layer_metrics(layer_head_gate_std_batches),
         "layer_head_gate_sparsity_02": average_layer_metrics(layer_head_gate_s02_batches),

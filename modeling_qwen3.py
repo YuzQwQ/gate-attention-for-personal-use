@@ -261,6 +261,8 @@ class Qwen3Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.use_qk_norm = config.use_qk_norm
         self.num_gate_groups = config.num_gate_groups
+        self.irg_attn_output_gate = config.irg_attn_output_gate
+        self.irg_routing_hidden_size = config.irg_routing_hidden_size
         self.hybrid_attn_output_gate = config.hybrid_attn_output_gate
         self.hybrid_gate_lambda = config.hybrid_gate_lambda
         self.attn_output_gate_temperature = config.attn_output_gate_temperature
@@ -273,10 +275,14 @@ class Qwen3Attention(nn.Module):
         self.use_shared_hybrid_attn_output_gate = (
             self.hybrid_attn_output_gate and not self.independent_attn_output_gate
         )
+        self.use_shared_irg_attn_output_gate = (
+            self.irg_attn_output_gate and not self.independent_attn_output_gate
+        )
         self.use_shared_groupwise_attn_output_gate = (
             self.num_gate_groups is not None
             and not self.independent_attn_output_gate
             and not self.hybrid_attn_output_gate
+            and not self.irg_attn_output_gate
         )
 
         if self.context_aware_attn_output_gate:
@@ -296,6 +302,9 @@ class Qwen3Attention(nn.Module):
         #         f" and `num_heads`: {self.num_heads})."
         #     )
         self.gate_proj = None
+        self.irg_router_up_proj = None
+        self.irg_router_down_proj = None
+        self.irg_group_gate_proj = None
         if self.independent_attn_output_gate:
             self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
             if self.headwise_attn_output_gate:
@@ -304,6 +313,17 @@ class Qwen3Attention(nn.Module):
                 self.gate_proj = nn.Linear(
                     self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias
                 )
+        elif self.use_shared_irg_attn_output_gate:
+            self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
+            self.irg_router_up_proj = nn.Linear(
+                self.head_dim, self.irg_routing_hidden_size, bias=config.qkv_bias
+            )
+            self.irg_router_down_proj = nn.Linear(
+                self.irg_routing_hidden_size, self.head_dim * self.num_gate_groups, bias=config.qkv_bias
+            )
+            self.irg_group_gate_proj = nn.Linear(
+                self.num_gate_groups, self.num_gate_groups, bias=config.qkv_bias
+            )
         elif self.use_shared_hybrid_attn_output_gate:
             self.q_proj = nn.Linear(
                 self.hidden_size,
@@ -373,9 +393,62 @@ class Qwen3Attention(nn.Module):
 
         return query_states, gate_score
 
+    def _apply_irg_attn_output_gate(self, attn_output: torch.Tensor) -> torch.Tensor:
+        routing_hidden = nn.functional.silu(self.irg_router_up_proj(attn_output))
+        routing_logits = self.irg_router_down_proj(routing_hidden)
+        bsz, q_len, num_heads, _ = attn_output.shape
+        routing_logits = routing_logits.view(bsz, q_len, num_heads, self.head_dim, self.num_gate_groups)
+        routing_probs = torch.softmax(routing_logits, dim=-1)
+
+        assignment_mass = routing_probs.sum(dim=-2).clamp_min(1e-6)
+        grouped_output = (routing_probs * attn_output.unsqueeze(-1)).sum(dim=-2) / assignment_mass
+        group_gate = torch.sigmoid(self.irg_group_gate_proj(grouped_output))
+        channel_gate = (routing_probs * group_gate.unsqueeze(-2)).sum(dim=-1)
+
+        final_stats = self._summarize_gate(channel_gate)
+        group_stats = self._summarize_gate(group_gate)
+        routing_entropy = (
+            -(routing_probs * routing_probs.clamp_min(1e-6).log()).sum(dim=-1).mean().detach().item()
+        )
+        routing_max_prob = routing_probs.max(dim=-1).values.mean().detach().item()
+        if q_len > 1:
+            routing_token_consistency = nn.functional.cosine_similarity(
+                routing_probs[:, :-1].reshape(-1, self.num_gate_groups),
+                routing_probs[:, 1:].reshape(-1, self.num_gate_groups),
+                dim=-1,
+            ).mean().detach().item()
+        else:
+            routing_token_consistency = None
+
+        self.last_gate_stats = {
+            "routing_hidden_size": self.irg_routing_hidden_size,
+            "routing_entropy": routing_entropy,
+            "routing_max_prob": routing_max_prob,
+            "routing_token_consistency": routing_token_consistency,
+            "irg_group_gate_mean": group_stats["mean"],
+            "irg_group_gate_std": group_stats["std"],
+            "irg_group_gate_sparsity_02": group_stats["sparsity_02"],
+            "mean": final_stats["mean"],
+            "std": final_stats["std"],
+            "sparsity_01": final_stats["sparsity_01"],
+            "sparsity_02": final_stats["sparsity_02"],
+            "raw_mean": final_stats["mean"],
+            "raw_std": final_stats["std"],
+            "raw_sparsity_01": final_stats["sparsity_01"],
+            "raw_sparsity_02": final_stats["sparsity_02"],
+            "base_mean": final_stats["mean"],
+            "base_std": final_stats["std"],
+            "base_sparsity_01": final_stats["sparsity_01"],
+            "base_sparsity_02": final_stats["sparsity_02"],
+        }
+        return attn_output * channel_gate
+
     def _apply_attn_output_gate(
             self, attn_output: torch.Tensor, gate_score: Optional[Union[torch.Tensor, dict]]
     ) -> torch.Tensor:
+        if self.use_shared_irg_attn_output_gate:
+            return self._apply_irg_attn_output_gate(attn_output)
+
         if gate_score is None:
             self.last_gate_stats = None
             return attn_output

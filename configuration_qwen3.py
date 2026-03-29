@@ -173,6 +173,8 @@ class Qwen3Config(PretrainedConfig):
         attention_dropout=0.0,
         use_qk_norm=True,
         num_gate_groups=None,
+        irg_attn_output_gate=False,
+        irg_routing_hidden_size=None,
         hybrid_attn_output_gate=False,
         hybrid_gate_lambda=0.5,
         attn_output_gate_temperature=1.0,
@@ -210,6 +212,8 @@ class Qwen3Config(PretrainedConfig):
         self.use_qk_norm = use_qk_norm
 
         self.num_gate_groups = num_gate_groups
+        self.irg_attn_output_gate = irg_attn_output_gate
+        self.irg_routing_hidden_size = irg_routing_hidden_size
         self.hybrid_attn_output_gate = hybrid_attn_output_gate
         self.hybrid_gate_lambda = hybrid_gate_lambda
         self.attn_output_gate_temperature = attn_output_gate_temperature
@@ -253,6 +257,31 @@ class Qwen3Config(PretrainedConfig):
             raise ValueError(
                 f"`head_dim` ({self.head_dim}) must be divisible by `num_gate_groups` ({self.num_gate_groups})."
             )
+
+        if self.irg_attn_output_gate:
+            if self.independent_attn_output_gate:
+                raise ValueError("`irg_attn_output_gate=True` is only supported for shared gating.")
+            if self.headwise_attn_output_gate or self.elementwise_attn_output_gate:
+                raise ValueError(
+                    "`irg_attn_output_gate=True` cannot be combined with legacy "
+                    "`headwise_attn_output_gate` / `elementwise_attn_output_gate` flags."
+                )
+            if self.hybrid_attn_output_gate:
+                raise ValueError("`irg_attn_output_gate=True` cannot be combined with `hybrid_attn_output_gate=True`.")
+            if self.num_gate_groups is None or self.num_gate_groups <= 1:
+                raise ValueError(
+                    "`irg_attn_output_gate=True` requires `num_gate_groups` to be set to an integer > 1."
+                )
+            if self.attn_output_gate_temperature != 1.0 or self.attn_output_gate_residual_alpha != 0.0:
+                raise ValueError(
+                    "`irg_attn_output_gate=True` cannot be combined with temperature or residual gate tweaks."
+                )
+            if self.irg_routing_hidden_size is None:
+                self.irg_routing_hidden_size = min(self.head_dim, 16)
+            elif self.irg_routing_hidden_size < 1:
+                raise ValueError("`irg_routing_hidden_size` must be a positive integer.")
+        elif self.irg_routing_hidden_size is not None:
+            raise ValueError("`irg_routing_hidden_size` requires `irg_attn_output_gate=True`.")
 
         if self.independent_attn_output_gate and not (
             self.headwise_attn_output_gate or self.elementwise_attn_output_gate

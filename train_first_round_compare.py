@@ -4,8 +4,10 @@ import json
 import math
 import random
 import re
+import shutil
 import site
 import sys
+import tempfile
 import time
 import types
 from pathlib import Path
@@ -131,6 +133,34 @@ def load_local_qwen_modules(repo_root: Path):
     config_cls = sys.modules[f"{package_name}.configuration_qwen3"].Qwen3Config
     model_cls = sys.modules[f"{package_name}.modeling_qwen3"].Qwen3ForCausalLM
     return config_cls, model_cls
+
+
+def load_tokenizer_compat(tokenizer_name_or_path: str):
+    def _from_pretrained(path_like):
+        try:
+            return AutoTokenizer.from_pretrained(path_like)
+        except ImportError as exc:
+            if "protobuf" not in str(exc).lower():
+                raise
+            return AutoTokenizer.from_pretrained(path_like, use_fast=False)
+
+    tokenizer_path = Path(tokenizer_name_or_path)
+    if tokenizer_path.exists():
+        config_path = tokenizer_path / "tokenizer_config.json"
+        if config_path.exists():
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(config.get("extra_special_tokens"), list):
+                compat_dir = Path(tempfile.mkdtemp(prefix="tokenizer_compat_"))
+                shutil.copytree(tokenizer_path, compat_dir, dirs_exist_ok=True)
+                config.pop("extra_special_tokens", None)
+                (compat_dir / "tokenizer_config.json").write_text(
+                    json.dumps(config, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                tokenizer = _from_pretrained(compat_dir)
+                tokenizer._compat_tokenizer_dir = str(compat_dir)
+                return tokenizer
+    return _from_pretrained(tokenizer_name_or_path)
 
 
 def set_seed(seed: int):
@@ -836,7 +866,7 @@ def main():
         resolve_variant_config(variant_name, args.head_dim)
 
     config_cls, model_cls = load_local_qwen_modules(repo_root)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path)
+    tokenizer = load_tokenizer_compat(args.tokenizer_name_or_path)
     train_dataset, valid_dataset = build_datasets(args, tokenizer)
 
     run_metadata = {

@@ -260,29 +260,56 @@ class Qwen3Attention(nn.Module):
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
         self.use_qk_norm = config.use_qk_norm
-        self.num_gate_groups = config.num_gate_groups
-        self.irg_attn_output_gate = config.irg_attn_output_gate
-        self.irg_routing_hidden_size = config.irg_routing_hidden_size
-        self.hybrid_attn_output_gate = config.hybrid_attn_output_gate
-        self.hybrid_gate_lambda = config.hybrid_gate_lambda
-        self.attn_output_gate_temperature = config.attn_output_gate_temperature
-        self.attn_output_gate_residual_alpha = config.attn_output_gate_residual_alpha
-        self.independent_attn_output_gate = config.independent_attn_output_gate
-        self.context_aware_attn_output_gate = config.context_aware_attn_output_gate
-        self.headwise_attn_output_gate = config.headwise_attn_output_gate
-        self.elementwise_attn_output_gate = config.elementwise_attn_output_gate
+        self.layer_gate_spec = config.get_layer_gate_spec(layer_idx) if config.uses_layer_gate_layout() else None
+        self.uses_layer_gate_layout = self.layer_gate_spec is not None
+        self.layer_gate_type = self.layer_gate_spec["gate_type"] if self.layer_gate_spec is not None else None
+
+        if self.uses_layer_gate_layout:
+            self.num_gate_groups = self.layer_gate_spec["num_gate_groups"]
+            self.irg_attn_output_gate = False
+            self.irg_routing_hidden_size = None
+            self.hybrid_attn_output_gate = False
+            self.hybrid_gate_lambda = config.hybrid_gate_lambda
+            self.attn_output_gate_temperature = 1.0
+            self.attn_output_gate_residual_alpha = 0.0
+            self.independent_attn_output_gate = False
+            self.context_aware_attn_output_gate = False
+            self.headwise_attn_output_gate = self.layer_gate_type == "shared_headwise"
+            self.elementwise_attn_output_gate = self.layer_gate_type == "shared_elementwise"
+            self.basis_gate_enabled = self.layer_gate_type == "basis"
+            self.basis_rank = self.layer_gate_spec["basis_rank"]
+            self.basis_alpha_norm = self.layer_gate_spec["basis_alpha_norm"]
+            self.basis_temperature = self.layer_gate_spec["basis_temperature"]
+        else:
+            self.num_gate_groups = config.num_gate_groups
+            self.irg_attn_output_gate = config.irg_attn_output_gate
+            self.irg_routing_hidden_size = config.irg_routing_hidden_size
+            self.hybrid_attn_output_gate = config.hybrid_attn_output_gate
+            self.hybrid_gate_lambda = config.hybrid_gate_lambda
+            self.attn_output_gate_temperature = config.attn_output_gate_temperature
+            self.attn_output_gate_residual_alpha = config.attn_output_gate_residual_alpha
+            self.independent_attn_output_gate = config.independent_attn_output_gate
+            self.context_aware_attn_output_gate = config.context_aware_attn_output_gate
+            self.headwise_attn_output_gate = config.headwise_attn_output_gate
+            self.elementwise_attn_output_gate = config.elementwise_attn_output_gate
+            self.basis_gate_enabled = config.basis_gate_enabled
+            self.basis_rank = config.basis_rank
+            self.basis_alpha_norm = config.basis_alpha_norm
+            self.basis_temperature = config.basis_temperature
         self.attn_implementation = getattr(config, "_attn_implementation", "eager")
+        self.use_basis_attn_output_gate = self.basis_gate_enabled
         self.use_shared_hybrid_attn_output_gate = (
-            self.hybrid_attn_output_gate and not self.independent_attn_output_gate
+            self.hybrid_attn_output_gate and not self.independent_attn_output_gate and not self.use_basis_attn_output_gate
         )
         self.use_shared_irg_attn_output_gate = (
-            self.irg_attn_output_gate and not self.independent_attn_output_gate
+            self.irg_attn_output_gate and not self.independent_attn_output_gate and not self.use_basis_attn_output_gate
         )
         self.use_shared_groupwise_attn_output_gate = (
             self.num_gate_groups is not None
             and not self.independent_attn_output_gate
             and not self.hybrid_attn_output_gate
             and not self.irg_attn_output_gate
+            and not self.use_basis_attn_output_gate
         )
 
         if self.context_aware_attn_output_gate:
@@ -305,6 +332,8 @@ class Qwen3Attention(nn.Module):
         self.irg_router_up_proj = None
         self.irg_router_down_proj = None
         self.irg_group_gate_proj = None
+        self.basis_alpha_proj = None
+        self.basis_gate_basis = None
         if self.independent_attn_output_gate:
             self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
             if self.headwise_attn_output_gate:
@@ -336,6 +365,11 @@ class Qwen3Attention(nn.Module):
                 self.num_heads * self.head_dim + self.num_heads * self.num_gate_groups,
                 bias=config.qkv_bias,
             )
+        elif self.use_basis_attn_output_gate:
+            self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
+            self.basis_alpha_proj = nn.Linear(self.head_dim, self.basis_rank, bias=config.qkv_bias)
+            self.basis_gate_basis = nn.Parameter(torch.empty(self.basis_rank, self.head_dim))
+            nn.init.normal_(self.basis_gate_basis, mean=0.0, std=config.initializer_range)
         else:
             self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
 
@@ -360,6 +394,9 @@ class Qwen3Attention(nn.Module):
             elif self.elementwise_attn_output_gate:
                 gate_score = self.gate_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
             query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        elif self.use_basis_attn_output_gate:
+            query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+            gate_score = {"basis_query": query_states.transpose(1, 2)}
         elif self.use_shared_hybrid_attn_output_gate:
             query_states = query_states.view(bsz, q_len, self.num_key_value_heads, -1)
             query_states, headwise_gate_score, groupwise_gate_score = torch.split(
@@ -443,6 +480,69 @@ class Qwen3Attention(nn.Module):
         }
         return attn_output * channel_gate
 
+    @staticmethod
+    def _summarize_basis_matrix(basis: torch.Tensor) -> dict:
+        basis = basis.float()
+        if basis.shape[0] <= 1:
+            offdiag_cosine_mean = 0.0
+            offdiag_cosine_max_abs = 0.0
+        else:
+            normalized_basis = nn.functional.normalize(basis, dim=-1)
+            cosine_matrix = normalized_basis @ normalized_basis.transpose(0, 1)
+            offdiag_mask = ~torch.eye(cosine_matrix.shape[0], dtype=torch.bool, device=cosine_matrix.device)
+            offdiag_values = cosine_matrix.masked_select(offdiag_mask)
+            offdiag_cosine_mean = offdiag_values.mean().detach().item()
+            offdiag_cosine_max_abs = offdiag_values.abs().max().detach().item()
+
+        singular_values = torch.linalg.svdvals(basis)
+        singular_total = singular_values.sum()
+        if singular_total.detach().item() == 0.0:
+            effective_rank = 0.0
+        else:
+            singular_probs = (singular_values / singular_total).clamp_min(1e-12)
+            effective_rank = torch.exp(-(singular_probs * singular_probs.log()).sum()).detach().item()
+
+        return {
+            "basis_offdiag_cosine_mean": offdiag_cosine_mean,
+            "basis_offdiag_cosine_max_abs": offdiag_cosine_max_abs,
+            "basis_effective_rank": effective_rank,
+        }
+
+    def _apply_basis_attn_output_gate(
+            self, attn_output: torch.Tensor, basis_query: torch.Tensor
+    ) -> torch.Tensor:
+        alpha = self.basis_alpha_proj(basis_query)
+        if self.basis_alpha_norm:
+            alpha = alpha / alpha.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        gate_logits = torch.matmul(alpha, self.basis_gate_basis)
+        base_gate = torch.sigmoid(gate_logits)
+        gate = torch.sigmoid(gate_logits / self.basis_temperature)
+
+        gate_stats = self._summarize_gate(gate)
+        base_stats = self._summarize_gate(base_gate)
+        basis_stats = self._summarize_basis_matrix(self.basis_gate_basis)
+
+        self.last_gate_stats = {
+            "temperature": self.basis_temperature,
+            "residual_alpha": 0.0,
+            "basis_rank": self.basis_rank,
+            "basis_alpha_norm": self.basis_alpha_norm,
+            "mean": gate_stats["mean"],
+            "std": gate_stats["std"],
+            "sparsity_01": gate_stats["sparsity_01"],
+            "sparsity_02": gate_stats["sparsity_02"],
+            "raw_mean": gate_stats["mean"],
+            "raw_std": gate_stats["std"],
+            "raw_sparsity_01": gate_stats["sparsity_01"],
+            "raw_sparsity_02": gate_stats["sparsity_02"],
+            "base_mean": base_stats["mean"],
+            "base_std": base_stats["std"],
+            "base_sparsity_01": base_stats["sparsity_01"],
+            "base_sparsity_02": base_stats["sparsity_02"],
+            **basis_stats,
+        }
+        return attn_output * gate
+
     def _apply_attn_output_gate(
             self, attn_output: torch.Tensor, gate_score: Optional[Union[torch.Tensor, dict]]
     ) -> torch.Tensor:
@@ -454,6 +554,8 @@ class Qwen3Attention(nn.Module):
             return attn_output
 
         if isinstance(gate_score, dict):
+            if "basis_query" in gate_score:
+                return self._apply_basis_attn_output_gate(attn_output, gate_score["basis_query"])
             head_gate = torch.sigmoid(gate_score["headwise"])
             group_gate = torch.sigmoid(gate_score["groupwise"])
             expanded_head_gate = head_gate.expand(-1, -1, -1, group_gate.shape[-1])

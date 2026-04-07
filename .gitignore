@@ -10,3 +10,8 @@ residual_g8_alpha_runs/
 temperature_g8_tau_runs/
 hybrid_g8_lambda_runs/
 irg_g8_runs/
+shared_groupwise_runs_smoke/
+wikitext103_assets/
+results/
+tmp_smoke_*/
+tmp_wikitext_probe.bin

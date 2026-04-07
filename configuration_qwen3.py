@@ -21,6 +21,8 @@
 # limitations under the License.
 """Qwen3 model configuration"""
 
+import copy
+
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
@@ -149,6 +151,14 @@ class Qwen3Config(PretrainedConfig):
         "layers.*.mlp.down_proj": "rowwise",
     }
 
+    _LAYER_GATE_TYPES = {
+        "none",
+        "shared_headwise",
+        "shared_groupwise",
+        "shared_elementwise",
+        "basis",
+    }
+
     def __init__(
         self,
         vocab_size=151936,
@@ -170,6 +180,7 @@ class Qwen3Config(PretrainedConfig):
         sliding_window=4096,
         max_window_layers=28,
         attention_bias=False,
+        qkv_bias=False,
         attention_dropout=0.0,
         use_qk_norm=True,
         num_gate_groups=None,
@@ -183,6 +194,11 @@ class Qwen3Config(PretrainedConfig):
         context_aware_attn_output_gate=False,
         elementwise_attn_output_gate=False,
         headwise_attn_output_gate=False,
+        layer_gate_layout=None,
+        basis_gate_enabled=False,
+        basis_rank=None,
+        basis_alpha_norm=False,
+        basis_temperature=1.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -208,6 +224,7 @@ class Qwen3Config(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
+        self.qkv_bias = qkv_bias
         self.attention_dropout = attention_dropout
         self.use_qk_norm = use_qk_norm
 
@@ -222,6 +239,11 @@ class Qwen3Config(PretrainedConfig):
         self.context_aware_attn_output_gate = context_aware_attn_output_gate
         self.headwise_attn_output_gate = headwise_attn_output_gate
         self.elementwise_attn_output_gate = elementwise_attn_output_gate
+        self.layer_gate_layout = None
+        self.basis_gate_enabled = basis_gate_enabled
+        self.basis_rank = basis_rank
+        self.basis_alpha_norm = basis_alpha_norm
+        self.basis_temperature = basis_temperature
 
         if not 0.0 <= self.hybrid_gate_lambda <= 1.0:
             raise ValueError("`hybrid_gate_lambda` must be within [0, 1].")
@@ -229,6 +251,10 @@ class Qwen3Config(PretrainedConfig):
             raise ValueError("`attn_output_gate_temperature` must be > 0.")
         if not 0.0 <= self.attn_output_gate_residual_alpha <= 1.0:
             raise ValueError("`attn_output_gate_residual_alpha` must be within [0, 1].")
+        if self.basis_temperature <= 0.0:
+            raise ValueError("`basis_temperature` must be > 0.")
+        if self.basis_rank is not None and self.basis_rank < 1:
+            raise ValueError("`basis_rank` must be a positive integer.")
 
         if self.context_aware_attn_output_gate and not self.independent_attn_output_gate:
             raise ValueError("`context_aware_attn_output_gate=True` requires `independent_attn_output_gate=True`.")
@@ -324,6 +350,51 @@ class Qwen3Config(PretrainedConfig):
                     "`hybrid_attn_output_gate=True` cannot be combined with temperature or residual gate tweaks."
                 )
 
+        if layer_gate_layout is not None:
+            if any(
+                (
+                    self.num_gate_groups is not None,
+                    self.irg_attn_output_gate,
+                    self.hybrid_attn_output_gate,
+                    self.independent_attn_output_gate,
+                    self.context_aware_attn_output_gate,
+                    self.headwise_attn_output_gate,
+                    self.elementwise_attn_output_gate,
+                    self.attn_output_gate_temperature != 1.0,
+                    self.attn_output_gate_residual_alpha != 0.0,
+                )
+            ):
+                raise ValueError(
+                    "`layer_gate_layout` cannot be combined with legacy global gate configuration flags."
+                )
+            self.layer_gate_layout = self._normalize_layer_gate_layout(
+                layer_gate_layout=layer_gate_layout,
+                num_hidden_layers=self.num_hidden_layers,
+                head_dim=self.head_dim,
+            )
+            self.basis_gate_enabled = any(
+                layer_spec["gate_type"] == "basis" for layer_spec in self.layer_gate_layout
+            )
+            if self.basis_gate_enabled:
+                basis_ranks = sorted(
+                    {layer_spec["basis_rank"] for layer_spec in self.layer_gate_layout if layer_spec["gate_type"] == "basis"}
+                )
+                self.basis_rank = basis_ranks[0] if len(basis_ranks) == 1 else None
+                basis_alpha_norms = {
+                    layer_spec["basis_alpha_norm"]
+                    for layer_spec in self.layer_gate_layout
+                    if layer_spec["gate_type"] == "basis"
+                }
+                self.basis_alpha_norm = len(basis_alpha_norms) == 1 and next(iter(basis_alpha_norms))
+                basis_temperatures = {
+                    layer_spec["basis_temperature"]
+                    for layer_spec in self.layer_gate_layout
+                    if layer_spec["gate_type"] == "basis"
+                }
+                self.basis_temperature = next(iter(basis_temperatures)) if len(basis_temperatures) == 1 else None
+        elif self.basis_gate_enabled and self.basis_rank is None:
+            raise ValueError("`basis_gate_enabled=True` requires `basis_rank` to be set.")
+
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
@@ -334,4 +405,81 @@ class Qwen3Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    @classmethod
+    def _normalize_layer_gate_layout(cls, layer_gate_layout, num_hidden_layers, head_dim):
+        if len(layer_gate_layout) != num_hidden_layers:
+            raise ValueError(
+                f"`layer_gate_layout` must contain exactly {num_hidden_layers} layer specs, "
+                f"got {len(layer_gate_layout)}."
+            )
+
+        normalized_layout = []
+        for layer_index, raw_spec in enumerate(layer_gate_layout):
+            if not isinstance(raw_spec, dict):
+                raise ValueError(f"Layer gate spec at index {layer_index} must be a dict.")
+
+            spec = copy.deepcopy(raw_spec)
+            gate_type = spec.get("gate_type")
+            if gate_type not in cls._LAYER_GATE_TYPES:
+                raise ValueError(
+                    f"Layer gate spec at index {layer_index} has invalid gate_type {gate_type!r}. "
+                    f"Supported values: {sorted(cls._LAYER_GATE_TYPES)}."
+                )
+
+            normalized_spec = {
+                "gate_type": gate_type,
+                "num_gate_groups": spec.get("num_gate_groups"),
+                "basis_rank": spec.get("basis_rank"),
+                "basis_alpha_norm": bool(spec.get("basis_alpha_norm", False)),
+                "basis_temperature": float(spec.get("basis_temperature", 1.0)),
+            }
+
+            if normalized_spec["basis_temperature"] <= 0.0:
+                raise ValueError(
+                    f"Layer gate spec at index {layer_index} must have `basis_temperature > 0`."
+                )
+
+            if gate_type == "none":
+                normalized_spec["num_gate_groups"] = None
+                normalized_spec["basis_rank"] = None
+            elif gate_type == "shared_headwise":
+                normalized_spec["num_gate_groups"] = 1
+                normalized_spec["basis_rank"] = None
+            elif gate_type == "shared_elementwise":
+                normalized_spec["num_gate_groups"] = head_dim
+                normalized_spec["basis_rank"] = None
+            elif gate_type == "shared_groupwise":
+                num_gate_groups = normalized_spec["num_gate_groups"]
+                if not isinstance(num_gate_groups, int) or num_gate_groups < 1:
+                    raise ValueError(
+                        f"Layer gate spec at index {layer_index} requires a positive integer `num_gate_groups`."
+                    )
+                if head_dim % num_gate_groups != 0:
+                    raise ValueError(
+                        f"Layer gate spec at index {layer_index} has `num_gate_groups={num_gate_groups}`, "
+                        f"which does not divide `head_dim={head_dim}`."
+                    )
+                normalized_spec["basis_rank"] = None
+            elif gate_type == "basis":
+                basis_rank = normalized_spec["basis_rank"]
+                if not isinstance(basis_rank, int) or basis_rank < 1:
+                    raise ValueError(
+                        f"Layer gate spec at index {layer_index} requires a positive integer `basis_rank`."
+                    )
+                normalized_spec["num_gate_groups"] = None
+
+            normalized_layout.append(normalized_spec)
+
+        return normalized_layout
+
+    def uses_layer_gate_layout(self):
+        return self.layer_gate_layout is not None
+
+    def get_layer_gate_spec(self, layer_idx):
+        if self.layer_gate_layout is None:
+            return None
+        if layer_idx is None or layer_idx < 0 or layer_idx >= len(self.layer_gate_layout):
+            raise IndexError(f"Layer index {layer_idx} is out of range for `layer_gate_layout`.")
+        return copy.deepcopy(self.layer_gate_layout[layer_idx])
 
